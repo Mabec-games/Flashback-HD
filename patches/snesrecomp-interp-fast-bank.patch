@@ -1,0 +1,46 @@
+diff --git a/runner/src/snes/interp_bridge.c b/runner/src/snes/interp_bridge.c
+index c1e48eb..ebab840 100644
+--- a/runner/src/snes/interp_bridge.c
++++ b/runner/src/snes/interp_bridge.c
+@@ -559,6 +559,13 @@ unsigned long long g_interp_bridge_steps = 0;
+  * manufactures coverage that was never executed. Report entered variants
+  * separately and join them by key instead. */
+ void (*g_interp_bridge_pc_hook)(uint32_t pc24, int m_flag, int x_flag) = 0;
++/* Interpreted code in this program bank (or in every bank, with
++ * g_interp_fast_all) costs 1/divisor of its cycles (a divisor below 2 is
++ * off). A port can make a CPU-bound routine faster in guest time; frames
++ * still end on the beam, so the APU keeps real time. */
++uint8_t g_interp_fast_bank = 0;
++uint8_t g_interp_fast_divisor = 0;
++bool g_interp_fast_all = false;
+ void (*g_interp_bridge_bounce_hook)(uint32_t pc24, int m_flag, int x_flag) = 0;
+ /* Architectural stack boundary of the currently active interpreter frame.
+  * A rewritten AOT return that has already popped above this boundary belongs
+@@ -2472,6 +2482,12 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
+             unsigned _internal = (unsigned)_cyc > s_interp_bus_cycles
+                                ? (unsigned)_cyc - s_interp_bus_cycles : 0;
+             uint64_t _master = s_interp_bus_master + (uint64_t)_internal * 6u;
++            if (g_interp_fast_divisor > 1 &&
++                (g_interp_fast_all ||
++                 ((pc_before >> 16) & 0xFF) == g_interp_fast_bank)) {
++                _master /= g_interp_fast_divisor;
++                _cyc = (_cyc + g_interp_fast_divisor - 1) / g_interp_fast_divisor;
++            }
+             g_interp_bridge_steps++;
+             cpu->cycles        += (uint64_t)_cyc;
+             cpu->master_cycles += _master;
+diff --git a/runner/src/snes/interp_bridge.h b/runner/src/snes/interp_bridge.h
+index e01e3ba..dcb0171 100644
+--- a/runner/src/snes/interp_bridge.h
++++ b/runner/src/snes/interp_bridge.h
+@@ -252,6 +252,10 @@ int interp_bridge_resume_task(CpuState *cpu, uint32_t resume_pc24,
+  * ENTERED -- an entry, not an extent, since a compiled body runs an unknown
+  * number of opcodes without reporting them. Do not treat a bounce as coverage
+  * of the body interior. */
++/* See interp_bridge.c. */
++extern uint8_t g_interp_fast_bank;
++extern uint8_t g_interp_fast_divisor;
++extern bool g_interp_fast_all;
+ extern void (*g_interp_bridge_pc_hook)(uint32_t pc24, int m_flag, int x_flag);
+ extern void (*g_interp_bridge_bounce_hook)(uint32_t pc24, int m_flag, int x_flag);
+ 

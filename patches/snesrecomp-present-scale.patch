@@ -1,0 +1,76 @@
+diff --git a/runner/src/desktop/host_main.c b/runner/src/desktop/host_main.c
+index 3bc3905..03e1d68 100644
+--- a/runner/src/desktop/host_main.c
++++ b/runner/src/desktop/host_main.c
+@@ -1196,12 +1196,31 @@ static void NoteStateFrame(void) {
+   snes_rewind_note_frame();
+ }
+ 
++/* The title's presentation scale (SnesDesktopHostGame.present_scale). */
++static int PresentScale(void) {
++  if (!g_game->present_scale || g_game->native_widescreen) return 1;
++  int scale = g_game->present_scale();
++  return scale < 2 ? 1 : (scale > 8 ? 8 : scale);
++}
++
++/* Nearest-neighbour copy of the 256-wide field into a scale-times frame. */
++static void UpscaleField(uint8 *dst, size_t pitch, int scale) {
++  const uint32 *src = (const uint32 *)g_my_pixels;
++  for (int y = 0; y < g_snes_height * scale; y++) {
++    uint32 *row = (uint32 *)(dst + (size_t)y * pitch);
++    const uint32 *line = src + (size_t)(y / scale) * 256;
++    for (int x = 0; x < g_snes_width * scale; x++)
++      row[x] = line[x / scale];
++  }
++}
++
+ void RtlDrawPpuFrame(uint8 *pixel_buffer, size_t pitch, uint32 render_flags) {
+   (void)render_flags;
+   if (!pixel_buffer) return;
++  const int scale = PresentScale();
+   if (g_game->draw_frame &&
+-      g_game->draw_frame(pixel_buffer, pitch, g_my_pixels, g_snes_width,
+-                         g_snes_height, g_present_alpha)) {
++      g_game->draw_frame(pixel_buffer, pitch, g_my_pixels, g_snes_width * scale,
++                         g_snes_height * scale, g_present_alpha)) {
+     /* Publish what the title actually composed. The debug surface otherwise
+      * captures g_ppu->renderBuffer, which for a game-owned compositor is the
+      * authentic 256-column raster it composed FROM -- so a wide frame reads
+@@ -1212,6 +1231,10 @@ void RtlDrawPpuFrame(uint8 *pixel_buffer, size_t pitch, uint32 render_flags) {
+     return;
+   }
+   debug_server_note_composed_frame(NULL, 0, 0, 0);
++  if (scale > 1) {
++    UpscaleField(pixel_buffer, pitch, scale);
++    return;
++  }
+   RtlWidescreenPresent(pixel_buffer, pitch, g_my_pixels, g_snes_width, g_snes_height);
+ }
+ 
+@@ -1283,7 +1306,7 @@ static void WritePpm(const char *path, const uint8 *pixel_buffer, int pitch,
+ static void DrawPpuFrameWithPerf(void) {
+   double profile_start = ProfileStart();
+   PreparePpuFrame();
+-  const int render_scale = 1;
++  const int render_scale = PresentScale();
+   uint8 *present_buffer = 0;
+   int present_pitch = 0;
+ 
+diff --git a/runner/src/desktop/host_main.h b/runner/src/desktop/host_main.h
+index 03b6f06..9aa2777 100644
+--- a/runner/src/desktop/host_main.h
++++ b/runner/src/desktop/host_main.h
+@@ -197,6 +197,13 @@ typedef struct SnesDesktopHostGame {
+   /* After the gameplay loop ends, before SDL resources are destroyed or a
+    * relaunch begins. Stop title-owned workers here. No further frames run. */
+   void (*on_shutdown)(void);
++  /* Present above the guest resolution. Return N (2..8) to have the host
++   * acquire an N-times larger presentation frame and pass that size to
++   * draw_frame, which can then draw at output resolution (a title's own HD
++   * renderer). If draw_frame returns 0 the host nearest-neighbour scales the
++   * PPU field. Window sizing, aspect and the guest frame are unchanged.
++   * NULL, or a return below 2, presents the native frame exactly as before. */
++  int (*present_scale)(void);
+ } SnesDesktopHostGame;
+ 
+ /* The whole program. Returns the process exit code. */

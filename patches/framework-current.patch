@@ -1,0 +1,298 @@
+diff --git a/runner/src/beam_frame_driver.c b/runner/src/beam_frame_driver.c
+index d6086b3..946a542 100644
+--- a/runner/src/beam_frame_driver.c
++++ b/runner/src/beam_frame_driver.c
+@@ -8,6 +8,8 @@
+  * rule below is a way the scaffold's earlier driver broke that chain. */
+ #include "beam_frame_driver.h"
+ 
++#include <string.h>
++
+ #include <stdbool.h>
+ #include <stdint.h>
+ 
+@@ -265,6 +267,33 @@ void snes_beam_frame_driver_draw_ppu_frame_observed(
+   ppu_rasterRenderEnd(g_ppu);
+ }
+ 
++typedef struct BeamExecState {
++  uint32_t resume_pc;
++  uint8_t wai_halted;
++} BeamExecState;
++
++size_t snes_beam_frame_driver_exec_state_bound(void) {
++  return sizeof(BeamExecState);
++}
++
++size_t snes_beam_frame_driver_exec_state_save(void *out, size_t capacity) {
++  BeamExecState st = {s_resume_pc, s_wai_halted ? 1 : 0};
++  if (capacity < sizeof st)
++    return 0;
++  memcpy(out, &st, sizeof st);
++  return sizeof st;
++}
++
++int snes_beam_frame_driver_exec_state_load(const void *in, size_t size) {
++  BeamExecState st;
++  if (size != sizeof st)
++    return 0;
++  memcpy(&st, in, sizeof st);
++  s_resume_pc = st.resume_pc;
++  s_wai_halted = st.wai_halted != 0;
++  return 1;
++}
++
+ void snes_beam_frame_driver_reset(void) {
+   s_resume_pc = 0;
+   s_wai_halted = false;
+diff --git a/runner/src/beam_frame_driver.h b/runner/src/beam_frame_driver.h
+index 60804fc..890e1bb 100644
+--- a/runner/src/beam_frame_driver.h
++++ b/runner/src/beam_frame_driver.h
+@@ -1,6 +1,8 @@
+ #ifndef SNESRECOMP_BEAM_FRAME_DRIVER_H
+ #define SNESRECOMP_BEAM_FRAME_DRIVER_H
+ 
++#include <stddef.h>
++
+ /* Beam-aligned frame driver for whole-program LLE ports.
+  *
+  * One host frame is one PPU field, cut where hardware raises NMI: the beam's
+@@ -28,5 +30,13 @@ void snes_beam_frame_driver_draw_ppu_frame_observed(
+     SnesBeamRasterObserver *observer, void *context);
+ /* Forget the booted machine: the next frame starts from the reset vector. */
+ void snes_beam_frame_driver_reset(void);
++/* The guest's execution position between frames (where the next frame
++ * resumes, and whether it is halted in WAI). It is not machine state, so a
++ * rollback snapshot only carries it through RtlGameInfo's exec_state hooks;
++ * a title using this driver should point those hooks here, or every rewind
++ * (run-ahead, rewind, netplay) resumes where the speculation stopped. */
++size_t snes_beam_frame_driver_exec_state_bound(void);
++size_t snes_beam_frame_driver_exec_state_save(void *out, size_t capacity);
++int snes_beam_frame_driver_exec_state_load(const void *in, size_t size);
+ 
+ #endif /* SNESRECOMP_BEAM_FRAME_DRIVER_H */
+diff --git a/runner/src/common_rtl.c b/runner/src/common_rtl.c
+index a56966b..5e34412 100644
+--- a/runner/src/common_rtl.c
++++ b/runner/src/common_rtl.c
+@@ -47,6 +47,9 @@
+ #include "host_report.h"
+ #include "cosim.h"
+ static void rtl_reset_audio_delivery(void);
++typedef struct RtlAudioDelivery RtlAudioDelivery;
++static RtlAudioDelivery *rtl_audio_delivery_save(void);
++static void rtl_audio_delivery_restore(const RtlAudioDelivery *saved);
+ #include "snes_runahead.h"
+ #if defined(SNESRECOMP_NET)
+ #include "snes_netplay.h"
+@@ -1426,6 +1429,7 @@ bool RtlRollbackLoadFromMemory(const void *data, size_t size) {
+    * are rewinding to. Lift it out around the guest blob. */
+   RtlApuLock();
+   dsp_output_ring_save(g_snes->apu->dsp, &ring);
++  const RtlAudioDelivery *delivery = rtl_audio_delivery_save();
+   RtlApuUnlock();
+ 
+   /* A rollback is not a timeline jump, and must not read as one.
+@@ -1458,6 +1462,7 @@ bool RtlRollbackLoadFromMemory(const void *data, size_t size) {
+ 
+   RtlApuLock();
+   dsp_output_ring_restore(g_snes->apu->dsp, &ring);
++  rtl_audio_delivery_restore(delivery);
+   if (ok)
+     rtl_rb_residue_apply(&residue);
+   RtlApuUnlock();
+@@ -2317,6 +2322,37 @@ static void rtl_reset_audio_delivery(void) {
+   s_render_fade_out = RTL_AUDIO_FADE_FRAMES;
+ }
+ 
++/* A rollback keeps the live delivery state, as it keeps the output ring: the
++ * consumer is mid-stream and the guest is going back exactly where it was.
++ * Resetting it (as a real load must) re-primed the audio on every rollback,
++ * so a host rolling back each frame (run-ahead, speculative rendering)
++ * output silence and stalled the producer behind the refilling cushion. */
++struct RtlAudioDelivery {
++  double phase, occ_ema;
++  int16 hold_l, hold_r;
++  int starved, fade_pos, fade_out;
++  bool priming;
++};
++static RtlAudioDelivery s_rollback_delivery;
++
++static RtlAudioDelivery *rtl_audio_delivery_save(void) {
++  s_rollback_delivery = (RtlAudioDelivery){
++    s_render_phase, s_render_occ_ema, s_render_hold_l, s_render_hold_r,
++    s_render_starved, s_render_fade_pos, s_render_fade_out, s_render_priming};
++  return &s_rollback_delivery;
++}
++
++static void rtl_audio_delivery_restore(const RtlAudioDelivery *saved) {
++  s_render_phase = saved->phase;
++  s_render_occ_ema = saved->occ_ema;
++  s_render_hold_l = saved->hold_l;
++  s_render_hold_r = saved->hold_r;
++  s_render_starved = saved->starved;
++  s_render_fade_pos = saved->fade_pos;
++  s_render_fade_out = saved->fade_out;
++  s_render_priming = saved->priming;
++}
++
+ static void rtl_render_wait(int16 *out, int frames) {
+   for (int i = 0; i < frames; ++i) {
+     int weight = s_render_fade_out > 0 ? --s_render_fade_out : 0;
+diff --git a/runner/src/desktop/host_main.c b/runner/src/desktop/host_main.c
+index 3bc3905..03e1d68 100644
+--- a/runner/src/desktop/host_main.c
++++ b/runner/src/desktop/host_main.c
+@@ -1196,12 +1196,31 @@ static void NoteStateFrame(void) {
+   snes_rewind_note_frame();
+ }
+ 
++/* The title's presentation scale (SnesDesktopHostGame.present_scale). */
++static int PresentScale(void) {
++  if (!g_game->present_scale || g_game->native_widescreen) return 1;
++  int scale = g_game->present_scale();
++  return scale < 2 ? 1 : (scale > 8 ? 8 : scale);
++}
++
++/* Nearest-neighbour copy of the 256-wide field into a scale-times frame. */
++static void UpscaleField(uint8 *dst, size_t pitch, int scale) {
++  const uint32 *src = (const uint32 *)g_my_pixels;
++  for (int y = 0; y < g_snes_height * scale; y++) {
++    uint32 *row = (uint32 *)(dst + (size_t)y * pitch);
++    const uint32 *line = src + (size_t)(y / scale) * 256;
++    for (int x = 0; x < g_snes_width * scale; x++)
++      row[x] = line[x / scale];
++  }
++}
++
+ void RtlDrawPpuFrame(uint8 *pixel_buffer, size_t pitch, uint32 render_flags) {
+   (void)render_flags;
+   if (!pixel_buffer) return;
++  const int scale = PresentScale();
+   if (g_game->draw_frame &&
+-      g_game->draw_frame(pixel_buffer, pitch, g_my_pixels, g_snes_width,
+-                         g_snes_height, g_present_alpha)) {
++      g_game->draw_frame(pixel_buffer, pitch, g_my_pixels, g_snes_width * scale,
++                         g_snes_height * scale, g_present_alpha)) {
+     /* Publish what the title actually composed. The debug surface otherwise
+      * captures g_ppu->renderBuffer, which for a game-owned compositor is the
+      * authentic 256-column raster it composed FROM -- so a wide frame reads
+@@ -1212,6 +1231,10 @@ void RtlDrawPpuFrame(uint8 *pixel_buffer, size_t pitch, uint32 render_flags) {
+     return;
+   }
+   debug_server_note_composed_frame(NULL, 0, 0, 0);
++  if (scale > 1) {
++    UpscaleField(pixel_buffer, pitch, scale);
++    return;
++  }
+   RtlWidescreenPresent(pixel_buffer, pitch, g_my_pixels, g_snes_width, g_snes_height);
+ }
+ 
+@@ -1283,7 +1306,7 @@ static void WritePpm(const char *path, const uint8 *pixel_buffer, int pitch,
+ static void DrawPpuFrameWithPerf(void) {
+   double profile_start = ProfileStart();
+   PreparePpuFrame();
+-  const int render_scale = 1;
++  const int render_scale = PresentScale();
+   uint8 *present_buffer = 0;
+   int present_pitch = 0;
+ 
+diff --git a/runner/src/desktop/host_main.h b/runner/src/desktop/host_main.h
+index 03b6f06..9aa2777 100644
+--- a/runner/src/desktop/host_main.h
++++ b/runner/src/desktop/host_main.h
+@@ -197,6 +197,13 @@ typedef struct SnesDesktopHostGame {
+   /* After the gameplay loop ends, before SDL resources are destroyed or a
+    * relaunch begins. Stop title-owned workers here. No further frames run. */
+   void (*on_shutdown)(void);
++  /* Present above the guest resolution. Return N (2..8) to have the host
++   * acquire an N-times larger presentation frame and pass that size to
++   * draw_frame, which can then draw at output resolution (a title's own HD
++   * renderer). If draw_frame returns 0 the host nearest-neighbour scales the
++   * PPU field. Window sizing, aspect and the guest frame are unchanged.
++   * NULL, or a return below 2, presents the native frame exactly as before. */
++  int (*present_scale)(void);
+ } SnesDesktopHostGame;
+ 
+ /* The whole program. Returns the process exit code. */
+diff --git a/runner/src/snes/interp_bridge.c b/runner/src/snes/interp_bridge.c
+index c1e48eb..ebab840 100644
+--- a/runner/src/snes/interp_bridge.c
++++ b/runner/src/snes/interp_bridge.c
+@@ -559,6 +559,13 @@ unsigned long long g_interp_bridge_steps = 0;
+  * manufactures coverage that was never executed. Report entered variants
+  * separately and join them by key instead. */
+ void (*g_interp_bridge_pc_hook)(uint32_t pc24, int m_flag, int x_flag) = 0;
++/* Interpreted code in this program bank (or in every bank, with
++ * g_interp_fast_all) costs 1/divisor of its cycles (a divisor below 2 is
++ * off). A port can make a CPU-bound routine faster in guest time; frames
++ * still end on the beam, so the APU keeps real time. */
++uint8_t g_interp_fast_bank = 0;
++uint8_t g_interp_fast_divisor = 0;
++bool g_interp_fast_all = false;
+ void (*g_interp_bridge_bounce_hook)(uint32_t pc24, int m_flag, int x_flag) = 0;
+ /* Architectural stack boundary of the currently active interpreter frame.
+  * A rewritten AOT return that has already popped above this boundary belongs
+@@ -1405,7 +1412,10 @@ static void interp_hist_time(uint32_t pc24, double dms) {
+ static int _hist_cmp(const void *a, const void *b) {
+     const double na = ((const InterpHistEnt *)a)->ms;
+     const double nb = ((const InterpHistEnt *)b)->ms;
+-    return na < nb ? 1 : (na > nb ? -1 : 0);
++    if (na != nb) return na < nb ? 1 : -1;
++    const uint64_t ca = ((const InterpHistEnt *)a)->n;
++    const uint64_t cb = ((const InterpHistEnt *)b)->n;
++    return ca < cb ? 1 : (ca > cb ? -1 : 0);
+ }
+ static void interp_hist_dump(void) {
+     unsigned count = 0;
+@@ -1416,7 +1426,7 @@ static void interp_hist_dump(void) {
+     double total_ms = 0.0;
+     uint64_t total = 0;
+     for (unsigned i = 0; i < PROFILE_HIST_CAP; i++) { total += s_interp_hist[i].n; total_ms += s_interp_hist[i].ms; }
+-    for (unsigned i = 0; i < 60 && i < PROFILE_HIST_CAP && s_interp_hist[i].n; i++)
++    for (unsigned i = 0; i < 20000 && i < PROFILE_HIST_CAP && s_interp_hist[i].n; i++)
+         fprintf(stderr, "  $%06X  %10.1f ms  %12llu  (%5.2f%% ms)\n",
+                 (unsigned)s_interp_hist[i].pc24,
+                 s_interp_hist[i].ms,
+@@ -2472,6 +2482,12 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
+             unsigned _internal = (unsigned)_cyc > s_interp_bus_cycles
+                                ? (unsigned)_cyc - s_interp_bus_cycles : 0;
+             uint64_t _master = s_interp_bus_master + (uint64_t)_internal * 6u;
++            if (g_interp_fast_divisor > 1 &&
++                (g_interp_fast_all ||
++                 ((pc_before >> 16) & 0xFF) == g_interp_fast_bank)) {
++                _master /= g_interp_fast_divisor;
++                _cyc = (_cyc + g_interp_fast_divisor - 1) / g_interp_fast_divisor;
++            }
+             g_interp_bridge_steps++;
+             cpu->cycles        += (uint64_t)_cyc;
+             cpu->master_cycles += _master;
+diff --git a/runner/src/snes/interp_bridge.h b/runner/src/snes/interp_bridge.h
+index e01e3ba..dcb0171 100644
+--- a/runner/src/snes/interp_bridge.h
++++ b/runner/src/snes/interp_bridge.h
+@@ -252,6 +252,10 @@ int interp_bridge_resume_task(CpuState *cpu, uint32_t resume_pc24,
+  * ENTERED -- an entry, not an extent, since a compiled body runs an unknown
+  * number of opcodes without reporting them. Do not treat a bounce as coverage
+  * of the body interior. */
++/* See interp_bridge.c. */
++extern uint8_t g_interp_fast_bank;
++extern uint8_t g_interp_fast_divisor;
++extern bool g_interp_fast_all;
+ extern void (*g_interp_bridge_pc_hook)(uint32_t pc24, int m_flag, int x_flag);
+ extern void (*g_interp_bridge_bounce_hook)(uint32_t pc24, int m_flag, int x_flag);
+ 
+diff --git a/runner/src/snes/ppu.c b/runner/src/snes/ppu.c
+index 25dcfe0..32baa56 100644
+--- a/runner/src/snes/ppu.c
++++ b/runner/src/snes/ppu.c
+@@ -2322,7 +2322,7 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
+     PpuDrawBackground_4bpp_opt(ppu, y, sub, 0, 0xc000, 0x8000);
+     PpuDrawBackground_4bpp_opt(ppu, y, sub, 1, 0xb100, 0x7100);
+   } else if (PPU_mode(ppu) == 3) {
+-    if (ppu->lineHasSprites) { PPU_T0; PpuDrawSprites(ppu, y, sub, true); PPU_ACC(g_ppu_sec_spr_ms); }
++    if (ppu->lineHasSprites) { PPU_T0_DECL PPU_T0; PpuDrawSprites(ppu, y, sub, true); PPU_ACC(g_ppu_sec_spr_ms); }
+     PpuDrawBackground_8bpp(ppu, y, sub, 0, 0xc000, 0x8000);
+     if (PPU_bigTiles(ppu, 1))
+       PpuDrawBackgroundBig(ppu, &ppu->bgBuffers[sub], y, sub, 1, 4,

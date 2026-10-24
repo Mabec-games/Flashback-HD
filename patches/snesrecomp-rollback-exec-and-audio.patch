@@ -1,0 +1,142 @@
+diff --git a/runner/src/beam_frame_driver.c b/runner/src/beam_frame_driver.c
+index d6086b3..946a542 100644
+--- a/runner/src/beam_frame_driver.c
++++ b/runner/src/beam_frame_driver.c
+@@ -8,6 +8,8 @@
+  * rule below is a way the scaffold's earlier driver broke that chain. */
+ #include "beam_frame_driver.h"
+ 
++#include <string.h>
++
+ #include <stdbool.h>
+ #include <stdint.h>
+ 
+@@ -265,6 +267,33 @@ void snes_beam_frame_driver_draw_ppu_frame_observed(
+   ppu_rasterRenderEnd(g_ppu);
+ }
+ 
++typedef struct BeamExecState {
++  uint32_t resume_pc;
++  uint8_t wai_halted;
++} BeamExecState;
++
++size_t snes_beam_frame_driver_exec_state_bound(void) {
++  return sizeof(BeamExecState);
++}
++
++size_t snes_beam_frame_driver_exec_state_save(void *out, size_t capacity) {
++  BeamExecState st = {s_resume_pc, s_wai_halted ? 1 : 0};
++  if (capacity < sizeof st)
++    return 0;
++  memcpy(out, &st, sizeof st);
++  return sizeof st;
++}
++
++int snes_beam_frame_driver_exec_state_load(const void *in, size_t size) {
++  BeamExecState st;
++  if (size != sizeof st)
++    return 0;
++  memcpy(&st, in, sizeof st);
++  s_resume_pc = st.resume_pc;
++  s_wai_halted = st.wai_halted != 0;
++  return 1;
++}
++
+ void snes_beam_frame_driver_reset(void) {
+   s_resume_pc = 0;
+   s_wai_halted = false;
+diff --git a/runner/src/beam_frame_driver.h b/runner/src/beam_frame_driver.h
+index 60804fc..890e1bb 100644
+--- a/runner/src/beam_frame_driver.h
++++ b/runner/src/beam_frame_driver.h
+@@ -1,6 +1,8 @@
+ #ifndef SNESRECOMP_BEAM_FRAME_DRIVER_H
+ #define SNESRECOMP_BEAM_FRAME_DRIVER_H
+ 
++#include <stddef.h>
++
+ /* Beam-aligned frame driver for whole-program LLE ports.
+  *
+  * One host frame is one PPU field, cut where hardware raises NMI: the beam's
+@@ -28,5 +30,13 @@ void snes_beam_frame_driver_draw_ppu_frame_observed(
+     SnesBeamRasterObserver *observer, void *context);
+ /* Forget the booted machine: the next frame starts from the reset vector. */
+ void snes_beam_frame_driver_reset(void);
++/* The guest's execution position between frames (where the next frame
++ * resumes, and whether it is halted in WAI). It is not machine state, so a
++ * rollback snapshot only carries it through RtlGameInfo's exec_state hooks;
++ * a title using this driver should point those hooks here, or every rewind
++ * (run-ahead, rewind, netplay) resumes where the speculation stopped. */
++size_t snes_beam_frame_driver_exec_state_bound(void);
++size_t snes_beam_frame_driver_exec_state_save(void *out, size_t capacity);
++int snes_beam_frame_driver_exec_state_load(const void *in, size_t size);
+ 
+ #endif /* SNESRECOMP_BEAM_FRAME_DRIVER_H */
+diff --git a/runner/src/common_rtl.c b/runner/src/common_rtl.c
+index a56966b..5e34412 100644
+--- a/runner/src/common_rtl.c
++++ b/runner/src/common_rtl.c
+@@ -47,6 +47,9 @@
+ #include "host_report.h"
+ #include "cosim.h"
+ static void rtl_reset_audio_delivery(void);
++typedef struct RtlAudioDelivery RtlAudioDelivery;
++static RtlAudioDelivery *rtl_audio_delivery_save(void);
++static void rtl_audio_delivery_restore(const RtlAudioDelivery *saved);
+ #include "snes_runahead.h"
+ #if defined(SNESRECOMP_NET)
+ #include "snes_netplay.h"
+@@ -1426,6 +1429,7 @@ bool RtlRollbackLoadFromMemory(const void *data, size_t size) {
+    * are rewinding to. Lift it out around the guest blob. */
+   RtlApuLock();
+   dsp_output_ring_save(g_snes->apu->dsp, &ring);
++  const RtlAudioDelivery *delivery = rtl_audio_delivery_save();
+   RtlApuUnlock();
+ 
+   /* A rollback is not a timeline jump, and must not read as one.
+@@ -1458,6 +1462,7 @@ bool RtlRollbackLoadFromMemory(const void *data, size_t size) {
+ 
+   RtlApuLock();
+   dsp_output_ring_restore(g_snes->apu->dsp, &ring);
++  rtl_audio_delivery_restore(delivery);
+   if (ok)
+     rtl_rb_residue_apply(&residue);
+   RtlApuUnlock();
+@@ -2317,6 +2322,37 @@ static void rtl_reset_audio_delivery(void) {
+   s_render_fade_out = RTL_AUDIO_FADE_FRAMES;
+ }
+ 
++/* A rollback keeps the live delivery state, as it keeps the output ring: the
++ * consumer is mid-stream and the guest is going back exactly where it was.
++ * Resetting it (as a real load must) re-primed the audio on every rollback,
++ * so a host rolling back each frame (run-ahead, speculative rendering)
++ * output silence and stalled the producer behind the refilling cushion. */
++struct RtlAudioDelivery {
++  double phase, occ_ema;
++  int16 hold_l, hold_r;
++  int starved, fade_pos, fade_out;
++  bool priming;
++};
++static RtlAudioDelivery s_rollback_delivery;
++
++static RtlAudioDelivery *rtl_audio_delivery_save(void) {
++  s_rollback_delivery = (RtlAudioDelivery){
++    s_render_phase, s_render_occ_ema, s_render_hold_l, s_render_hold_r,
++    s_render_starved, s_render_fade_pos, s_render_fade_out, s_render_priming};
++  return &s_rollback_delivery;
++}
++
++static void rtl_audio_delivery_restore(const RtlAudioDelivery *saved) {
++  s_render_phase = saved->phase;
++  s_render_occ_ema = saved->occ_ema;
++  s_render_hold_l = saved->hold_l;
++  s_render_hold_r = saved->hold_r;
++  s_render_starved = saved->starved;
++  s_render_fade_pos = saved->fade_pos;
++  s_render_fade_out = saved->fade_out;
++  s_render_priming = saved->priming;
++}
++
+ static void rtl_render_wait(int16 *out, int frames) {
+   for (int i = 0; i < frames; ++i) {
+     int weight = s_render_fade_out > 0 ? --s_render_fade_out : 0;

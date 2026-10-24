@@ -1,0 +1,38 @@
+diff --git a/runner/src/snes/interp_bridge.c b/runner/src/snes/interp_bridge.c
+index c1e48eb..0eb8439 100644
+--- a/runner/src/snes/interp_bridge.c
++++ b/runner/src/snes/interp_bridge.c
+@@ -1405,7 +1405,10 @@ static void interp_hist_time(uint32_t pc24, double dms) {
+ static int _hist_cmp(const void *a, const void *b) {
+     const double na = ((const InterpHistEnt *)a)->ms;
+     const double nb = ((const InterpHistEnt *)b)->ms;
+-    return na < nb ? 1 : (na > nb ? -1 : 0);
++    if (na != nb) return na < nb ? 1 : -1;
++    const uint64_t ca = ((const InterpHistEnt *)a)->n;
++    const uint64_t cb = ((const InterpHistEnt *)b)->n;
++    return ca < cb ? 1 : (ca > cb ? -1 : 0);
+ }
+ static void interp_hist_dump(void) {
+     unsigned count = 0;
+@@ -1416,7 +1419,7 @@ static void interp_hist_dump(void) {
+     double total_ms = 0.0;
+     uint64_t total = 0;
+     for (unsigned i = 0; i < PROFILE_HIST_CAP; i++) { total += s_interp_hist[i].n; total_ms += s_interp_hist[i].ms; }
+-    for (unsigned i = 0; i < 60 && i < PROFILE_HIST_CAP && s_interp_hist[i].n; i++)
++    for (unsigned i = 0; i < 20000 && i < PROFILE_HIST_CAP && s_interp_hist[i].n; i++)
+         fprintf(stderr, "  $%06X  %10.1f ms  %12llu  (%5.2f%% ms)\n",
+                 (unsigned)s_interp_hist[i].pc24,
+                 s_interp_hist[i].ms,
+diff --git a/runner/src/snes/ppu.c b/runner/src/snes/ppu.c
+index 25dcfe0..32baa56 100644
+--- a/runner/src/snes/ppu.c
++++ b/runner/src/snes/ppu.c
+@@ -2322,7 +2322,7 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
+     PpuDrawBackground_4bpp_opt(ppu, y, sub, 0, 0xc000, 0x8000);
+     PpuDrawBackground_4bpp_opt(ppu, y, sub, 1, 0xb100, 0x7100);
+   } else if (PPU_mode(ppu) == 3) {
+-    if (ppu->lineHasSprites) { PPU_T0; PpuDrawSprites(ppu, y, sub, true); PPU_ACC(g_ppu_sec_spr_ms); }
++    if (ppu->lineHasSprites) { PPU_T0_DECL PPU_T0; PpuDrawSprites(ppu, y, sub, true); PPU_ACC(g_ppu_sec_spr_ms); }
+     PpuDrawBackground_8bpp(ppu, y, sub, 0, 0xc000, 0x8000);
+     if (PPU_bigTiles(ppu, 1))
+       PpuDrawBackgroundBig(ppu, &ppu->bgBuffers[sub], y, sub, 1, 4,

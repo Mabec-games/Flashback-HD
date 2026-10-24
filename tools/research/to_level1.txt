@@ -1,0 +1,10 @@
+# Boot -> intro (no input) -> title -> Start -> wake-up cutscene -> Titan level 1.
+# Title menu appears around frame 4080; gameplay in the first room by ~frame 5000.
+wait 4300
+press start 3
+wait 120
+press start 3
+wait 360
+press start 3
+wait 300
+dump level1_room1
