@@ -84,6 +84,8 @@ snesrecomp_target_generated_code(FlashbackSNESRecomp ${CMAKE_SOURCE_DIR}/src/gen
 # it is now also enforced: a project with packages that never calls this fails
 # to configure.
 snesrecomp_target_mod_catalog(FlashbackSNESRecomp ${CMAKE_SOURCE_DIR}/mods/preloaded)
+# Ship the title-screen pack beside every locally built executable.
+snesrecomp_target_stage_dir(FlashbackSNESRecomp ${CMAKE_SOURCE_DIR}/assets/hd hd)
 # Any other directory the game reads exe-relative (a translations/ table, ...)
 # is staged with snesrecomp_target_stage_dir, never with a separate ALL target.
 

@@ -22,9 +22,9 @@ research so someone else can continue from here.
 
 ### Main menu
 
-The custom Flashback HD title screen. The pictured replacement title art is
-not bundled with this source snapshot; without an HD pack, the game falls
-back to its original title screen. See [HD pack setup](docs/HD_PACK.md).
+The custom Flashback HD title screen. The background and logo are included
+in `assets/hd/title/` and copied beside the executable automatically when
+you build. See [HD pack setup](docs/HD_PACK.md).
 
 ![Flashback HD main menu](docs/screenshots/main-menu.png)
 
@@ -136,5 +136,5 @@ fan project, with no affiliation or endorsement implied.
 The existing [PolyForm Noncommercial license](LICENSE) and attribution are
 preserved. Forks and continued development must respect those terms and the
 framework's own licenses. The code license does not grant rights to the
-original game or its artwork. Screenshots document the prototype; game data
-and replacement title assets are not distributed as a playable package here.
+original game or its artwork. Screenshots document the prototype. The replacement title background and logo
+are included; the original ROM and a prebuilt game are not.

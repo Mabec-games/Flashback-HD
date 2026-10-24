@@ -1,6 +1,8 @@
 # HD pack
 
 Replacement art is loaded at runtime from a pack folder, never compiled in.
+The supplied pack is tracked in `assets/hd/`; CMake stages it into `hd/` beside
+the executable when the executable is built. It includes both title assets.
 Default location: `hd/` next to the executable. Override with
 `FLASHBACK_HD_PACK=/path/to/pack`.
 
